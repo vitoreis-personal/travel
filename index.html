@@ -334,6 +334,21 @@
       flex-wrap: wrap;
       gap: 6px;
     }
+    .route-cell {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      align-items: flex-start;
+    }
+    .route-estimate {
+      font-weight: 900;
+      color: var(--forest);
+      line-height: 1.2;
+    }
+    .route-note {
+      font-size: .78rem;
+      color: var(--muted);
+    }
     .tracker-link-row a {
       display: inline-flex;
       align-items: center;
@@ -953,18 +968,18 @@
 
     <section id="tracker">
       <h2>Trip Tracker</h2>
-      <p class="lead">Use this table while you are in Stockholm. Ticked places are saved on this device. Tap Walk or Drive to open Google Maps with live time and distance.</p>
+      <p class="lead">Use this table while you are in Stockholm. Add an address to show estimated time and distance in the table, then tap Walk or Drive for the exact Google Maps route.</p>
 
       <div class="tracker-panel">
         <div class="tracker-controls">
           <label>
-            Your address or current base
+            Optional address or current base
             <input id="trackerAddress" type="text" autocomplete="street-address" placeholder="Example: Bank Hotel, Arsenalsgatan 6, Stockholm">
           </label>
           <button type="button" id="useCurrentLocation">Use phone location in Maps</button>
           <button type="button" id="updateDistances" class="mini-button secondary">Save address for route links</button>
         </div>
-        <div class="tracker-status" id="trackerStatus">Phone-safe mode: tap Walk or Drive to open exact live routing in Google Maps. Leave the address blank to let Maps use your phone's current location.</div>
+        <div class="tracker-status" id="trackerStatus">Add your address, then tap Save address for route links to calculate estimated walk and drive times in the table.</div>
       </div>
 
       <h3>Places to Visit</h3>
@@ -976,8 +991,8 @@
               <th>Place</th>
               <th>Type</th>
               <th>Website / tickets</th>
-              <th>live walk route</th>
-              <th>Live drive route</th>
+              <th>Walk time</th>
+              <th>Drive time</th>
               <th>Map</th>
             </tr>
           </thead>
@@ -994,8 +1009,8 @@
               <th>Restaurant</th>
               <th>Style</th>
               <th>Website / booking</th>
-              <th>live walk route</th>
-              <th>Live drive route</th>
+              <th>Walk time</th>
+              <th>Drive time</th>
               <th>Map</th>
             </tr>
           </thead>
@@ -1101,7 +1116,9 @@
 
     const trackerStorageKey = "stockholmTripTrackerV1";
     const addressStorageKey = "stockholmTripTrackerAddressV1";
+    const coordsStorageKey = "stockholmTripTrackerCoordsV1";
     let originLabel = "";
+    let originCoords = null;
 
     function loadVisited() {
       try { return JSON.parse(localStorage.getItem(trackerStorageKey) || "{}"); }
@@ -1123,6 +1140,77 @@
       return "https://www.google.com/maps/dir/?" + params.toString();
     }
 
+    function formatDistance(km) {
+      if (!Number.isFinite(km)) return "";
+      if (km < 1) return `${Math.round(km * 1000)} m`;
+      return `${km.toFixed(1)} km`;
+    }
+
+    function formatMinutes(minutes) {
+      if (!Number.isFinite(minutes)) return "";
+      if (minutes < 2) return "1-2 min";
+      if (minutes < 15) return `${Math.round(minutes)} min`;
+      return `${Math.round(minutes / 5) * 5} min`;
+    }
+
+    function haversineKm(a, b) {
+      const radiusKm = 6371;
+      const toRad = deg => deg * Math.PI / 180;
+      const dLat = toRad(b.lat - a.lat);
+      const dLng = toRad(b.lng - a.lng);
+      const lat1 = toRad(a.lat);
+      const lat2 = toRad(b.lat);
+      const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+      return 2 * radiusKm * Math.asin(Math.sqrt(h));
+    }
+
+    function estimateRoute(item, mode) {
+      if (!originCoords) {
+        return {
+          primary: "Add address",
+          note: "Then save"
+        };
+      }
+      const directKm = haversineKm(originCoords, item);
+      if (mode === "walking") {
+        const routeKm = Math.max(directKm * 1.22, directKm + 0.08);
+        return {
+          primary: `${formatMinutes(routeKm / 4.7 * 60)} walk`,
+          note: `est. ${formatDistance(routeKm)}`
+        };
+      }
+      const routeKm = Math.max(directKm * 1.35, directKm + 0.25);
+      const minutes = Math.max(4, routeKm / 18 * 60 + 2);
+      return {
+        primary: `${formatMinutes(minutes)} drive`,
+        note: `est. ${formatDistance(routeKm)}`
+      };
+    }
+
+    function routeCell(item, mode) {
+      const estimate = estimateRoute(item, mode);
+      const label = mode === "walking" ? "Walk" : "Drive";
+      return `
+        <div class="route-cell">
+          <div class="route-estimate">${estimate.primary}</div>
+          <div class="route-note">${estimate.note}</div>
+          <div class="tracker-link-row"><a href="${mapsUrl(item.address, mode)}">${label}</a></div>
+        </div>
+      `;
+    }
+
+    async function geocodeAddress(address) {
+      const url = "https://nominatim.openstreetmap.org/search?format=json&limit=1&q=" + encodeURIComponent(address);
+      const response = await fetch(url, { headers: { "Accept": "application/json" } });
+      if (!response.ok) throw new Error("Address lookup failed");
+      const results = await response.json();
+      if (!results.length) throw new Error("Address not found");
+      return {
+        lat: Number(results[0].lat),
+        lng: Number(results[0].lon)
+      };
+    }
+
     function renderTrackerTable(kind, targetId) {
       const visited = loadVisited();
       const rows = document.getElementById(targetId);
@@ -1135,8 +1223,8 @@
             <td><strong>${item.name}</strong><div class="sub">${item.address}</div></td>
             <td>${item.type}</td>
             <td><div class="tracker-link-row"><a href="${item.website}">Website</a><a href="${item.booking}">${kind === "eat" ? "Book" : "Tickets"}</a></div></td>
-            <td><div class="tracker-link-row"><a href="${mapsUrl(item.address, "walking")}">Walk</a></div></td>
-            <td><div class="tracker-link-row"><a href="${mapsUrl(item.address, "driving")}">Drive</a></div></td>
+            <td>${routeCell(item, "walking")}</td>
+            <td>${routeCell(item, "driving")}</td>
             <td><div class="tracker-link-row"><a href="https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(item.address)}">Open map</a></div></td>
           </tr>
         `;
@@ -1158,34 +1246,75 @@
       renderTrackerTable("eat", "eatTrackerRows");
     }
 
-    function updateFromAddress() {
+    async function updateFromAddress() {
       const input = document.getElementById("trackerAddress");
       const status = document.getElementById("trackerStatus");
       const address = input.value.trim();
       if (!address) {
         originLabel = "";
+        originCoords = null;
         localStorage.removeItem(addressStorageKey);
+        localStorage.removeItem(coordsStorageKey);
         renderAllTrackers();
-        status.textContent = "Route links will open in Google Maps from your phone's current location.";
+        status.textContent = "Add an address to show estimated times here, or tap Walk / Drive to let Google Maps use your current location.";
         return;
       }
       originLabel = address;
       localStorage.setItem(addressStorageKey, address);
-      renderAllTrackers();
-      status.textContent = "Route links updated. Tap Walk or Drive for exact live distance and time in Google Maps.";
+      status.textContent = "Looking up your address and calculating estimated times...";
+      try {
+        originCoords = await geocodeAddress(address);
+        localStorage.setItem(coordsStorageKey, JSON.stringify(originCoords));
+        renderAllTrackers();
+        status.textContent = "Estimated times are shown in the table. Tap Walk or Drive for the exact Google Maps route.";
+      } catch (error) {
+        originCoords = null;
+        localStorage.removeItem(coordsStorageKey);
+        renderAllTrackers();
+        status.textContent = "I could not find that address. Try a fuller address, or use the Walk / Drive buttons for Google Maps.";
+      }
     }
 
     function updateFromCurrentLocation() {
       const status = document.getElementById("trackerStatus");
-      originLabel = "";
-      document.getElementById("trackerAddress").value = "";
-      localStorage.removeItem(addressStorageKey);
-      renderAllTrackers();
-      status.textContent = "Route links now let Google Maps use your phone's current location for exact live distance and time.";
+      if (!navigator.geolocation) {
+        status.textContent = "Your browser does not allow location here. Type your address instead.";
+        return;
+      }
+      status.textContent = "Asking your phone for location permission...";
+      navigator.geolocation.getCurrentPosition(position => {
+        originLabel = "";
+        originCoords = {
+          lat: position.coords.latitude,
+          lng: position.coords.longitude
+        };
+        document.getElementById("trackerAddress").value = "";
+        localStorage.removeItem(addressStorageKey);
+        localStorage.setItem(coordsStorageKey, JSON.stringify(originCoords));
+        renderAllTrackers();
+        status.textContent = "Estimated times are using your phone location. Tap Walk or Drive for the exact Google Maps route.";
+      }, () => {
+        originLabel = "";
+        originCoords = null;
+        document.getElementById("trackerAddress").value = "";
+        localStorage.removeItem(addressStorageKey);
+        localStorage.removeItem(coordsStorageKey);
+        renderAllTrackers();
+        status.textContent = "Location permission was not available. Type your address to show estimated times in the table.";
+      }, {
+        enableHighAccuracy: true,
+        timeout: 10000,
+        maximumAge: 60000
+      });
     }
 
     document.addEventListener("DOMContentLoaded", () => {
       const savedAddress = localStorage.getItem(addressStorageKey);
+      const savedCoords = localStorage.getItem(coordsStorageKey);
+      if (savedCoords) {
+        try { originCoords = JSON.parse(savedCoords); }
+        catch { originCoords = null; }
+      }
       if (savedAddress) document.getElementById("trackerAddress").value = savedAddress;
       document.getElementById("updateDistances").addEventListener("click", updateFromAddress);
       document.getElementById("useCurrentLocation").addEventListener("click", updateFromCurrentLocation);
@@ -1193,7 +1322,11 @@
         if (event.key === "Enter") updateFromAddress();
       });
       renderAllTrackers();
-      if (savedAddress) updateFromAddress();
+      if (savedAddress && !originCoords) updateFromAddress();
+      if (savedAddress && originCoords) {
+        originLabel = savedAddress;
+        document.getElementById("trackerStatus").textContent = "Estimated times are shown from your saved address. Tap Walk or Drive for exact Google Maps routing.";
+      }
     });
   </script>
 </body>
