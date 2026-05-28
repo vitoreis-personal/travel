@@ -1119,6 +1119,7 @@
     const coordsStorageKey = "stockholmTripTrackerCoordsV1";
     let originLabel = "";
     let originCoords = null;
+    let routeCache = {}; // { "item-id:walking": { distKm, durMin }, ... }
 
     function loadVisited() {
       try { return JSON.parse(localStorage.getItem(trackerStorageKey) || "{}"); }
@@ -1165,26 +1166,71 @@
     }
 
     function estimateRoute(item, mode) {
-      if (!originCoords) {
+      const cached = routeCache[`${item.id}:${mode}`];
+      if (cached) {
+        const label = mode === "walking" ? "walk" : "drive";
+        const min = Math.round(cached.durMin);
+        const timeStr = min < 1 ? "1 min" : `${min} min`;
         return {
-          primary: "Add address",
-          note: "Then save"
+          primary: `${timeStr} ${label}`,
+          note: formatDistance(cached.distKm)
         };
       }
+      if (!originCoords) {
+        return { primary: "Add address", note: "Then save" };
+      }
+      // Haversine fallback while routes are still loading
       const directKm = haversineKm(originCoords, item);
       if (mode === "walking") {
         const routeKm = Math.max(directKm * 1.22, directKm + 0.08);
         return {
-          primary: `${formatMinutes(routeKm / 4.7 * 60)} walk`,
-          note: `est. ${formatDistance(routeKm)}`
+          primary: `~${formatMinutes(routeKm / 4.7 * 60)} walk`,
+          note: `~${formatDistance(routeKm)}`
         };
       }
       const routeKm = Math.max(directKm * 1.35, directKm + 0.25);
       const minutes = Math.max(4, routeKm / 18 * 60 + 2);
       return {
-        primary: `${formatMinutes(minutes)} drive`,
-        note: `est. ${formatDistance(routeKm)}`
+        primary: `~${formatMinutes(minutes)} drive`,
+        note: `~${formatDistance(routeKm)}`
       };
+    }
+
+    async function fetchAllRoutes(status) {
+      if (!originCoords) return;
+      const allItems = [...trackerItems.visit, ...trackerItems.eat];
+      const sources = [{ lat: originCoords.lat, lon: originCoords.lng }];
+      const targets = allItems.map(i => ({ lat: i.lat, lon: i.lng }));
+      let gotRealData = false;
+      // Valhalla matrix API: supports pedestrian + auto, returns km and seconds
+      for (const [costing, mode] of [["pedestrian", "walking"], ["auto", "driving"]]) {
+        try {
+          const res = await fetch("https://valhalla.openstreetmap.de/sources_to_targets", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ sources, targets, costing })
+          });
+          if (!res.ok) continue;
+          const data = await res.json();
+          const row = data.sources_to_targets?.[0];
+          if (!row) continue;
+          row.forEach((cell, i) => {
+            if (cell.time != null && cell.distance != null) {
+              routeCache[`${allItems[i].id}:${mode}`] = {
+                distKm: cell.distance,
+                durMin: cell.time / 60
+              };
+              gotRealData = true;
+            }
+          });
+        } catch { /* fall back to haversine estimates */ }
+      }
+      renderAllTrackers();
+      if (status) {
+        status.textContent = gotRealData
+          ? "Real walk and drive distances loaded. Tap Walk or Drive for the Google Maps route."
+          : "Estimated times shown (routing service unavailable). Tap Walk or Drive for exact Google Maps route.";
+      }
     }
 
     function routeCell(item, mode) {
@@ -1253,22 +1299,26 @@
       if (!address) {
         originLabel = "";
         originCoords = null;
+        routeCache = {};
         localStorage.removeItem(addressStorageKey);
         localStorage.removeItem(coordsStorageKey);
         renderAllTrackers();
-        status.textContent = "Add an address to show estimated times here, or tap Walk / Drive to let Google Maps use your current location.";
+        status.textContent = "Add an address to show walk and drive times, or tap Walk / Drive to let Google Maps use your current location.";
         return;
       }
       originLabel = address;
       localStorage.setItem(addressStorageKey, address);
-      status.textContent = "Looking up your address and calculating estimated times...";
+      status.textContent = "Looking up your address...";
       try {
         originCoords = await geocodeAddress(address);
         localStorage.setItem(coordsStorageKey, JSON.stringify(originCoords));
+        routeCache = {};
         renderAllTrackers();
-        status.textContent = "Estimated times are shown in the table. Tap Walk or Drive for the exact Google Maps route.";
+        status.textContent = "Fetching real walk and drive distances...";
+        await fetchAllRoutes(status);
       } catch (error) {
         originCoords = null;
+        routeCache = {};
         localStorage.removeItem(coordsStorageKey);
         renderAllTrackers();
         status.textContent = "I could not find that address. Try a fuller address, or use the Walk / Drive buttons for Google Maps.";
@@ -1282,25 +1332,28 @@
         return;
       }
       status.textContent = "Asking your phone for location permission...";
-      navigator.geolocation.getCurrentPosition(position => {
+      navigator.geolocation.getCurrentPosition(async position => {
         originLabel = "";
         originCoords = {
           lat: position.coords.latitude,
           lng: position.coords.longitude
         };
+        routeCache = {};
         document.getElementById("trackerAddress").value = "";
         localStorage.removeItem(addressStorageKey);
         localStorage.setItem(coordsStorageKey, JSON.stringify(originCoords));
         renderAllTrackers();
-        status.textContent = "Estimated times are using your phone location. Tap Walk or Drive for the exact Google Maps route.";
+        status.textContent = "Fetching real walk and drive distances from your location...";
+        await fetchAllRoutes(status);
       }, () => {
         originLabel = "";
         originCoords = null;
+        routeCache = {};
         document.getElementById("trackerAddress").value = "";
         localStorage.removeItem(addressStorageKey);
         localStorage.removeItem(coordsStorageKey);
         renderAllTrackers();
-        status.textContent = "Location permission was not available. Type your address to show estimated times in the table.";
+        status.textContent = "Location permission was not available. Type your address to show walk and drive times.";
       }, {
         enableHighAccuracy: true,
         timeout: 10000,
@@ -1325,7 +1378,13 @@
       if (savedAddress && !originCoords) updateFromAddress();
       if (savedAddress && originCoords) {
         originLabel = savedAddress;
-        document.getElementById("trackerStatus").textContent = "Estimated times are shown from your saved address. Tap Walk or Drive for exact Google Maps routing.";
+        const status = document.getElementById("trackerStatus");
+        status.textContent = "Fetching real walk and drive distances from your saved address...";
+        fetchAllRoutes(status);
+      } else if (!savedAddress && originCoords) {
+        const status = document.getElementById("trackerStatus");
+        status.textContent = "Fetching real walk and drive distances from your saved location...";
+        fetchAllRoutes(status);
       }
     });
   </script>
